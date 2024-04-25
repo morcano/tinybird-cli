@@ -9,10 +9,18 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	tokensapi "tinybird-cli/api/tokens"
 )
 
 var scope string
+
+type job struct {
+	token          tokensapi.Token
+	completeChan   chan tokensapi.PutTokenParams
+	failedCounter  *int32
+	successCounter *int32
+}
 
 var PutToken = &cobra.Command{
 	Use:   "put",
@@ -42,6 +50,11 @@ func bulkUpdate(client *tokensapi.Client, tokens []tokensapi.Token) {
 	p := mpb.New(mpb.WithWidth(64))
 	total := len(tokens)
 	var successCount, failedCount int32
+	var wg sync.WaitGroup
+
+	numWorkers := 10
+	jobs := make(chan job, total)
+	completeChan := make(chan tokensapi.PutTokenParams, total)
 
 	bar := p.AddBar(int64(total),
 		mpb.PrependDecorators(
@@ -55,30 +68,50 @@ func bulkUpdate(client *tokensapi.Client, tokens []tokensapi.Token) {
 		),
 	)
 
-	var wg sync.WaitGroup
-	wg.Add(total)
-
-	for _, token := range tokens {
-		go func(t tokensapi.Token) {
-			defer wg.Done()
-			payload := tokensapi.PutTokenParams{
-				Token: t.Token,
+	// Spawn workers
+	for w := 1; w <= numWorkers; w++ {
+		go func(id int) {
+			for j := range jobs {
+				time.Sleep(500 * time.Millisecond) // Add delay here
+				payload := tokensapi.PutTokenParams{
+					Token: j.token.Token,
+				}
+				scopeList := strings.Split(scope, ",")
+				for _, scope := range scopeList {
+					payload.Scope = append(payload.Scope, scope+":accountId="+j.token.GetAccountIdFromName())
+				}
+				err := client.Put(payload)
+				if err != nil {
+					atomic.AddInt32(j.failedCounter, 1)
+				} else {
+					atomic.AddInt32(j.successCounter, 1)
+				}
+				j.completeChan <- payload
 			}
-			// TODO: Remove the hardcoded sql_filter
-			scopeList := strings.Split(scope, ",")
-			for _, scope := range scopeList {
-				payload.Scope = append(payload.Scope, scope+":accountId="+t.GetAccountIdFromName())
-			}
-			err := client.Put(payload)
-			if err != nil {
-				atomic.AddInt32(&failedCount, 1)
-			} else {
-				atomic.AddInt32(&successCount, 1)
-			}
-			bar.Increment()
-		}(token)
+		}(w)
 	}
 
+	// Submit jobs to workers
+	for _, token := range tokens {
+		jobs <- job{
+			token:          token,
+			completeChan:   completeChan,
+			failedCounter:  &failedCount,
+			successCounter: &successCount,
+		}
+		wg.Add(1)
+	}
+	close(jobs) // This signals to the workers that no more jobs are coming
+
+	// Monitor completions
+	go func() {
+		for range completeChan {
+			bar.Increment()
+			wg.Done()
+		}
+	}()
+
+	// Wait until all jobs are done
 	wg.Wait()
 	p.Wait()
 }
